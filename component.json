@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "component",
+  "kind": "library",
+  "origin": {
+    "repository": "https://github.com/roolrz/HypeR",
+    "commit": "8d42d047058a2b58a291803700e86487fb723f7a"
+  },
+  "sources": {
+    "Cargo.toml": "lib/component/Cargo.toml",
+    "src/connection.rs": "lib/component/src/connection.rs",
+    "src/installation.rs": "lib/component/src/installation.rs",
+    "src/lib.rs": "lib/component/src/lib.rs",
+    "src/objects.rs": "lib/component/src/objects.rs",
+    "tests/connection.rs": "lib/component/tests/connection.rs",
+    "tests/connection_error.rs": "lib/component/tests/connection_error.rs",
+    "tests/prepared_retention.rs": "lib/component/tests/prepared_retention.rs"
+  },
+  "SPDX-FileCopyrightText": "2026 roolrz",
+  "SPDX-License-Identifier": "Apache-2.0",
+  "mounts": {
+    "": "lib/component"
+  },
+  "packages": [
+    "hyper-component"
+  ],
+  "tests": [
+    [
+      "make",
+      "app-test",
+      "APP_TEST_PACKAGE=hyper-component"
+    ]
+  ]
+}
