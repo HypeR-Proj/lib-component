@@ -30,5 +30,32 @@
       "app-test",
       "APP_TEST_PACKAGE=hyper-component"
     ]
-  ]
+  ],
+  "cargo_context": {
+    "Cargo.toml": {
+      "workspace": null,
+      "membership": "../../app",
+      "dependency_paths": {
+        "/dependencies/hyper-service-ipc": "lib/service-ipc",
+        "/dependencies/hyper-component-config": "lib/component-config"
+      },
+      "inherited_dependencies": {
+        "/dependencies/hyper-os": {
+          "workspace": true
+        },
+        "/dependencies/hyper-service-ipc": {
+          "workspace": true
+        },
+        "/dependencies/hyper-component-config": {
+          "workspace": true
+        },
+        "/dependencies/serde": {
+          "workspace": true
+        },
+        "/dependencies/serde_json": {
+          "workspace": true
+        }
+      }
+    }
+  }
 }
