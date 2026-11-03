@@ -255,28 +255,36 @@ pub struct Call {
 
 /// Receive on the caller's private endpoint. No caller-selected instance ID is
 /// accepted, and every request's reply storage is allocated by that caller.
-pub fn receive(connector: &CapabilityChannel, until: u64) -> Result<Call> {
+pub fn receive(
+    connector: &CapabilityChannel,
+    until: u64,
+) -> Result<hyper_service_ipc::Admission<Call>> {
+    use hyper_service_ipc::{Admission, Rejection as Refusal};
     let mut bytes = [MaybeUninit::uninit(); MAX_MESSAGE];
     let mut slots = [
         CapabilityReceiveSlot::new::<ByteChannelObject>(REPLY_RIGHTS),
         CapabilityReceiveSlot::new::<CapabilityChannelObject>(SESSION_RIGHTS),
     ];
-    let message = connector.receive(until, &mut bytes, &mut slots)?;
-    let request: Request =
-        serde_json::from_slice(message.bytes()).map_err(|_| Error::InvalidResponse)?;
+    let message = match connector.receive(until, &mut bytes, &mut slots) {
+        Ok(message) => message,
+        Err(error) => return hyper_service_ipc::admission::receive_failure(error),
+    };
+    let Ok(request) = serde_json::from_slice::<Request>(message.bytes()) else {
+        return Ok(Admission::Rejected(Refusal::InvalidMessage));
+    };
     let expected = if matches!(request, Request::Connect { .. }) {
         2
     } else {
         1
     };
     if message.capability_count() != expected {
-        return Err(Error::InvalidResponse);
+        return Ok(Admission::Rejected(Refusal::InvalidMessage));
     }
-    Ok(Call {
+    Ok(Admission::Accepted(Call {
         request,
         reply: slots[0].take()?.ok_or(Error::MissingHandle)?,
         session: slots[1].take()?,
-    })
+    }))
 }
 
 /// Small replies never block the reactor. A failed send closes the reply owner;
@@ -289,19 +297,27 @@ pub fn respond(reply: OwnedHandle<ByteChannelObject>, error: Option<Rejection>) 
 
 /// Providers receive independent session endpoints, then speak their own wire
 /// protocol directly. The manager neither parses nor forwards that protocol.
-pub fn accept(outgoing: &CapabilityChannel, until: u64) -> Result<(String, CapabilityChannel)> {
+pub fn accept(
+    outgoing: &CapabilityChannel,
+    until: u64,
+) -> Result<hyper_service_ipc::Admission<(String, CapabilityChannel)>> {
+    use hyper_service_ipc::{Admission, Rejection as Refusal};
     let mut bytes = [MaybeUninit::uninit(); MAX_MESSAGE];
     let mut slots = [CapabilityReceiveSlot::new::<CapabilityChannelObject>(
         SESSION_RIGHTS,
     )];
-    let message = outgoing.receive(until, &mut bytes, &mut slots)?;
+    let message = match outgoing.receive(until, &mut bytes, &mut slots) {
+        Ok(message) => message,
+        Err(error) => return hyper_service_ipc::admission::receive_failure(error),
+    };
     if message.capability_count() != 1 {
-        return Err(Error::InvalidResponse);
+        return Ok(Admission::Rejected(Refusal::InvalidMessage));
     }
-    let delivery: Delivery =
-        serde_json::from_slice(message.bytes()).map_err(|_| Error::InvalidResponse)?;
-    Ok((
+    let Ok(delivery) = serde_json::from_slice::<Delivery>(message.bytes()) else {
+        return Ok(Admission::Rejected(Refusal::InvalidMessage));
+    };
+    Ok(Admission::Accepted((
         delivery.capability,
         CapabilityChannel::from_handle(slots[0].take()?.ok_or(Error::MissingHandle)?),
-    ))
+    )))
 }

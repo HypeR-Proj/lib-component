@@ -235,42 +235,55 @@ pub fn descriptors(request: &Request) -> Result<Vec<(u32, Rights)>> {
 
 /// This worker may block on a malformed coordinator, but never the lifecycle
 /// reactor. The endpoint is not delegated to arbitrary components.
-pub fn receive(listener: &CapabilityChannel) -> Result<Call> {
+pub fn receive(listener: &CapabilityChannel) -> Result<hyper_service_ipc::Admission<Call>> {
+    use hyper_service_ipc::{Admission, Rejection};
     let mut bytes = [MaybeUninit::uninit(); MAX_BYTES];
     let mut slots = [CapabilityReceiveSlot::new::<CapabilityChannelObject>(
         crate::connection::SESSION_RIGHTS,
     )];
-    let message = listener.receive(hyper_os::DEADLINE_INFINITE, &mut bytes, &mut slots)?;
+    let message = match listener.receive(hyper_os::DEADLINE_INFINITE, &mut bytes, &mut slots) {
+        Ok(message) => message,
+        Err(error) => return hyper_service_ipc::admission::receive_failure(error),
+    };
     if message.capability_count() != 1 {
-        return Err(Error::InvalidResponse);
+        return Ok(Admission::Rejected(Rejection::InvalidMessage));
     }
-    let request: Request =
-        serde_json::from_slice(message.bytes()).map_err(|_| Error::InvalidResponse)?;
+    let Ok(request) = serde_json::from_slice::<Request>(message.bytes()) else {
+        return Ok(Admission::Rejected(Rejection::InvalidMessage));
+    };
     let reply = CapabilityChannel::from_handle(slots[0].take()?.ok_or(Error::MissingHandle)?);
     let deadline = hyper_os::time::deadline_after(std::time::Duration::from_secs(60))?.as_raw();
-    let descriptors = descriptors(&request)?;
-    let mut slots: Vec<_> = descriptors
+    let Ok(descriptors) = descriptors(&request) else {
+        return Ok(Admission::Rejected(Rejection::InvalidMessage));
+    };
+    let Ok(mut slots) = descriptors
         .iter()
         .map(|(kind, rights)| Object::receive_slot(*kind, *rights))
-        .collect::<Result<_>>()?;
+        .collect::<Result<Vec<_>>>()
+    else {
+        return Ok(Admission::Rejected(Rejection::InvalidMessage));
+    };
     let mut bytes = [MaybeUninit::uninit(); 64];
-    let message = reply.receive(deadline, &mut bytes, &mut slots)?;
+    let message = match reply.receive(deadline, &mut bytes, &mut slots) {
+        Ok(message) => message,
+        Err(error) => return hyper_service_ipc::admission::private_failure(error),
+    };
     if message.bytes() != b"HYPER-COMPONENT-INSTALL/1"
         || message.capability_count() != descriptors.len()
     {
-        return Err(Error::InvalidResponse);
+        return Ok(Admission::Rejected(Rejection::InvalidMessage));
     }
     let objects = descriptors
         .iter()
         .zip(&mut slots)
         .map(|((kind, _), slot)| Object::take(*kind, slot))
         .collect::<Result<_>>()?;
-    Ok(Call {
+    Ok(Admission::Accepted(Call {
         request,
         objects,
         reply,
         deadline,
-    })
+    }))
 }
 
 pub fn logging(
