@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use core::mem::MaybeUninit;
-use hyper_os::{
-    Error, Result, Status, capability_channel::*, channel::create_pair, handle::*, wait::*,
-};
+use hyper_os::{Error, Result, capability_channel::*, channel::create_pair, handle::*, wait::*};
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_RIGHTS: Rights = Rights::READ
@@ -31,6 +29,10 @@ pub enum Request {
     /// A supervised child or a local service subsystem failed. The manager
     /// supplies the authenticated parent identity and reporting policy.
     ReportFailure {
+        message: String,
+    },
+    /// A local integrity or availability failure requires unconditional console reporting.
+    ReportCriticalFailure {
         message: String,
     },
 }
@@ -68,19 +70,10 @@ impl Rejection {
             message: message.as_ref().chars().take(256).collect(),
         }
     }
-
-    pub const fn status(&self) -> Status {
-        match self.kind {
-            RejectionKind::NotOffered => Status::ACCESS_DENIED,
-            RejectionKind::InvalidRequest => Status::INVALID_ARGUMENT,
-            RejectionKind::Unavailable => Status::PEER_CLOSED,
-            RejectionKind::Restarting => Status::BUSY,
-            RejectionKind::TimedOut => Status::TIMED_OUT,
-            RejectionKind::ResourceLimit => Status::RESOURCE_LIMIT,
-        }
-    }
 }
 
+/// A transport failure or an authenticated routing rejection. Propagate this
+/// type (or retain it in an application error); a status alone loses information.
 #[derive(Debug)]
 pub enum ConnectionError {
     Transport(Error),
@@ -93,15 +86,6 @@ impl From<Error> for ConnectionError {
     }
 }
 
-impl From<ConnectionError> for Error {
-    fn from(error: ConnectionError) -> Self {
-        match error {
-            ConnectionError::Transport(error) => error,
-            ConnectionError::Rejected(error) => Error::Status(error.status()),
-        }
-    }
-}
-
 impl core::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -111,7 +95,14 @@ impl core::fmt::Display for ConnectionError {
     }
 }
 
-impl std::error::Error for ConnectionError {}
+impl std::error::Error for ConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Rejected(_) => None,
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -139,17 +130,22 @@ pub fn connect(
     Ok(client)
 }
 
-pub fn publish(connector: HandleRef<'_, CapabilityChannelObject>, name: &str) -> Result<()> {
+pub fn publish(
+    connector: HandleRef<'_, CapabilityChannelObject>,
+    name: &str,
+) -> core::result::Result<(), ConnectionError> {
     transact(
         connector,
         Request::Publish { name: name.into() },
         None,
         hyper_service_ipc::deadline()?,
     )
-    .map_err(Into::into)
 }
 
-pub fn status(connector: HandleRef<'_, CapabilityChannelObject>, message: &str) -> Result<()> {
+pub fn status(
+    connector: HandleRef<'_, CapabilityChannelObject>,
+    message: &str,
+) -> core::result::Result<(), ConnectionError> {
     transact(
         connector,
         Request::Status {
@@ -158,7 +154,6 @@ pub fn status(connector: HandleRef<'_, CapabilityChannelObject>, message: &str) 
         None,
         hyper_service_ipc::deadline()?,
     )
-    .map_err(Into::into)
 }
 
 /// Report a delegated failure without relying on journal or a surviving child.
@@ -166,7 +161,7 @@ pub fn status(connector: HandleRef<'_, CapabilityChannelObject>, message: &str) 
 pub fn report_failure(
     connector: HandleRef<'_, CapabilityChannelObject>,
     message: &str,
-) -> Result<()> {
+) -> core::result::Result<(), ConnectionError> {
     transact(
         connector,
         Request::ReportFailure {
@@ -175,7 +170,22 @@ pub fn report_failure(
         None,
         hyper_os::time::deadline_after(std::time::Duration::from_millis(500))?.as_raw(),
     )
-    .map_err(Into::into)
+}
+
+/// Report a critical local failure with authenticated component identity. The
+/// component manager retains a Console fallback independent of filesystems.
+pub fn report_critical_failure(
+    connector: HandleRef<'_, CapabilityChannelObject>,
+    message: &str,
+) -> core::result::Result<(), ConnectionError> {
+    transact(
+        connector,
+        Request::ReportCriticalFailure {
+            message: message.chars().take(MAX_MESSAGE).collect(),
+        },
+        None,
+        hyper_os::time::deadline_after(std::time::Duration::from_millis(500))?.as_raw(),
+    )
 }
 
 /// Bound diagnostic text by its complete wire representation: JSON escaping
@@ -186,13 +196,20 @@ fn encode_request(mut request: Request) -> Result<Vec<u8>> {
     {
         message.truncate(end);
     }
+    if let Request::ReportCriticalFailure { message } = &mut request
+        && let Some((end, _)) = message.char_indices().nth(MAX_MESSAGE)
+    {
+        message.truncate(end);
+    }
     loop {
         let bytes = serde_json::to_vec(&request).map_err(|_| Error::InvalidResponse)?;
         if bytes.len() <= MAX_MESSAGE {
             return Ok(bytes);
         }
         match &mut request {
-            Request::Status { message } | Request::ReportFailure { message }
+            Request::Status { message }
+            | Request::ReportFailure { message }
+            | Request::ReportCriticalFailure { message }
                 if !message.is_empty() =>
             {
                 message.pop();
@@ -247,6 +264,10 @@ fn transact(
 #[path = "../tests/connection.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "../tests/connection_error.rs"]
+mod error_tests;
+
 pub struct Call {
     pub request: Request,
     pub reply: OwnedHandle<ByteChannelObject>,
@@ -290,9 +311,40 @@ pub fn receive(
 /// Small replies never block the reactor. A failed send closes the reply owner;
 /// the caller then observes peer closure rather than an unbounded wait.
 pub fn respond(reply: OwnedHandle<ByteChannelObject>, error: Option<Rejection>) {
-    if let Ok(bytes) = serde_json::to_vec(&Reply { error }) {
+    if let Ok(bytes) = encode_reply(Reply { error }) {
         let _ = reply.as_byte_channel().try_send(&bytes);
     }
+}
+
+fn encode_reply(mut reply: Reply) -> Result<Vec<u8>> {
+    // Serialize the fixed envelope first so every rejection kind gets its exact
+    // remaining budget. Only the diagnostic may be shortened, at a UTF-8 boundary.
+    let message = reply
+        .error
+        .as_mut()
+        .map(|error| core::mem::take(&mut error.message));
+    let envelope = serde_json::to_vec(&reply).map_err(|_| Error::InvalidResponse)?;
+    let mut remaining = MAX_MESSAGE
+        .checked_sub(envelope.len())
+        .ok_or(Error::InvalidResponse)?;
+    if let (Some(error), Some(mut message)) = (reply.error.as_mut(), message) {
+        let mut end = 0;
+        for character in message.chars() {
+            let encoded = match character {
+                '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+                '\u{0}'..='\u{1f}' => 6,
+                _ => character.len_utf8(),
+            };
+            let Some(next) = remaining.checked_sub(encoded) else {
+                break;
+            };
+            remaining = next;
+            end += character.len_utf8();
+        }
+        message.truncate(end);
+        error.message = message;
+    }
+    serde_json::to_vec(&reply).map_err(|_| Error::InvalidResponse)
 }
 
 /// Providers receive independent session endpoints, then speak their own wire
