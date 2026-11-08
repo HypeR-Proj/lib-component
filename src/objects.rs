@@ -53,5 +53,5 @@ objects! {
     TaskInspector(TaskInspectorObject), ObjectInspector(ObjectInspectorObject),
     MemoryInspector(MemoryInspectorObject), CpuInspector(CpuInspectorObject),
     DeviceAuthority(DeviceAssignmentAuthorityObject), VmAuthority(VirtualMachineCreationAuthorityObject),
-    RootTransition(RootTransitionObject),
+    RootTransition(RootTransitionObject), ExecutableAuthority(ExecutableAuthorityObject),
 }
