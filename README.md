@@ -53,3 +53,10 @@ requires CRITICAL severity even when the component itself is not configured as
 critical. It uses the component manager's Console fallback independently of the
 journal. Diagnostic text is bounded by the complete wire frame; the sender should
 retain its full structured incident for administrative queries.
+
+The typed object inventory supports `ExecutableAuthorityObject` for explicit
+object-capability routes. Carrying this authority does not implicitly grant it
+to children: the deployment must export and offer the object, and the target
+component must request it with a `use` declaration. The SDK publication API
+creates an immutable executable copy; component routing supplies authority,
+not a bypass for writable/executable memory restrictions.
